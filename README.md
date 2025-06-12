@@ -60,7 +60,7 @@ ESQ部分不仅符合softmax的输出分布，并且其指数特性使得它的�
 
 (3VWG): The difference between ESQ and common log quantizers is not obvious, and I think the paper does not detail explain the improvements and advantages of ESQ. (ESQ与其他log非均匀量化的差异与优化)
 
-(3VWG): The comparison in experiments is not sufficient. The effectiveness of Hadamard matrix has been proven in [1][2], but are not compared. (实验部分，未与大模型的hadmard变换相关的进行对比，有点难补这个实验)
+(3VWG): The comparison in experiments is not sufficient. The effectiveness of Hadamard matrix has been proven in [1][2], but are not compared. (实验部分，未与大模型的hadmard变换相关的进行对比，为什么没有对比：Quarot等方法有针对llm模型结构的适配，比如将RMSnorm的可学习参数的调整，使之变换可融入后续的权重中等，上述改动并不能直接搬用于DiT模型中，我们的研究针对DiT的结构进行了适配（adanorm），并且针对于qk注意力分数纯在的普遍分布差异的现象，提出进一步的head-wise scaling，在不引入额外计算的前提下，实现了注意力分数的有效平滑（这一段在创新点回复也可以说。），比如有点难补这个实验)
 
 (CV2U): The color selection in the right figure of Fig. 7 can be improved appropriately, it is now difficult to understand.
 
