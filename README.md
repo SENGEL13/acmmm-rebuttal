@@ -18,7 +18,7 @@ ESQ部分不仅符合softmax的输出分布，并且其指数特性使得它的�
 
 ## 2、是否是针对扩散模型相关
 
-(VdQz): 2. Both HOM and ESQ are closely tied to standard components of Multi-Head Attention and quantization techniques. They do not appear to be specifically designed with the unique characteristics of Diffusion Transformers in mind. (不针对扩散模型)
+(VdQz): 2. Both HOM and ESQ are closely tied to standard components of Multi-Head Attention and quantization techniques. They do not appear to be specifically designed with the unique characteristics of Diffusion Transformers in mind. (不针对扩散模型？在引入hardmard变换的过程中，针对DiT模型的结构进行了适配（入adanorm）)
 
 (JA2J): Do outliers exist with all kinds of current diffusion models? The authors need to discuss the prevalence of the phenomenon to support the proposed method. (扩散模型是否都存在异常值问题，transformer-base的存在)
 
