@@ -1,20 +1,7 @@
-import sys
-import os
-# 获取当前脚本的目录
-current_dir = os.path.dirname(os.path.abspath(__file__))
-
-# 获取上上层目录的路径
-package_dir1 = os.path.abspath(os.path.join(current_dir, '../../'))
-package_dir2 = os.path.abspath(os.path.join(current_dir, '../../../'))
-
-# 添加上上层目录到 sys.path
-sys.path.append(package_dir1)
-sys.path.append(package_dir2)
-
 import torch
 import torch.nn as nn
 import quarot
-from timm.layers.helpers import to_2tuple
+# from timm.layers.helpers import to_2tuple
 from functools import partial
 from quarot.nn import Quantizer, Linear4bit, RMSNorm, OnlineHadamard
 # from timm.models.vision_transformer import Attention, Mlp
@@ -32,13 +19,13 @@ class Attention(nn.Module):
             attn_drop: float = 0.,
             proj_drop: float = 0.,
             norm_layer: nn.Module = nn.LayerNorm,
+            fp16=True,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
@@ -48,6 +35,9 @@ class Attention(nn.Module):
         self.scale_qkv = None
         self.scale_proj = None
         self.time_step = 0
+        self.fp16 = fp16
+        if self.fp16:
+            self.half()
 
     def forward(self, x, calib=False):
         B, N, C = x.shape  # [b=100, n=256, d=1152]
@@ -58,16 +48,16 @@ class Attention(nn.Module):
         q, k = self.q_norm(q), self.k_norm(k)
 
         q = q * self.scale
-        if not calib and self.use_act_quant:
-            attn = self.act_quantizer_q(q) @ self.act_quantizer_k(k).transpose(-2, -1)
-        else:
-            attn = q @ k.transpose(-2, -1)
+        # if not calib and self.use_act_quant:
+        #     attn = self.act_quantizer_q(q) @ self.act_quantizer_k(k).transpose(-2, -1)
+        # else:
+        attn = q @ k.transpose(-2, -1)
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-        if not calib and self.use_act_quant:
-            x = self.act_quantizer_w(attn) @ self.act_quantizer_v(v)
-        else:
-            x = attn @ v
+        # if not calib and self.use_act_quant:
+        #     x = self.act_quantizer_w(attn) @ self.act_quantizer_v(v)
+        # else:
+        x = attn @ v
 
         x = x.transpose(1, 2).reshape(B, N, C)  # [b, n, d]
 
@@ -123,22 +113,26 @@ class Mlp(nn.Module):
             bias=True,
             drop=0.,
             use_conv=False,
+            fp16=True,
     ):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
         self.in_features = in_features
         self.hidden_features = hidden_features
-        bias = to_2tuple(bias)
-        drop_probs = to_2tuple(drop)
+        # bias = to_2tuple(bias)
+        # drop_probs = to_2tuple(drop)
         linear_layer = partial(nn.Conv2d, kernel_size=1) if use_conv else nn.Linear
 
-        self.fc1 = linear_layer(in_features, hidden_features, bias=bias[0])
+        self.fc1 = linear_layer(in_features, hidden_features, bias=bias)
         self.act = act_layer()
-        self.drop1 = nn.Dropout(drop_probs[0])
+        self.drop1 = nn.Dropout(drop)
         self.norm = norm_layer(hidden_features) if norm_layer is not None else nn.Identity()
-        self.fc2 = linear_layer(hidden_features, out_features, bias=bias[1])
-        self.drop2 = nn.Dropout(drop_probs[1])
+        self.fc2 = linear_layer(hidden_features, out_features, bias=bias)
+        self.drop2 = nn.Dropout(drop)
+        self.fp16 = fp16
+        if self.fp16:
+            self.half()
 
     def forward(self, x):
         x = self.fc1(x)
@@ -162,9 +156,32 @@ class FlattenMlp(Mlp):
         )
 
     def forward(self, x):
-        x = self.quantizer(x)
         x = self.fc1_hadamard(x)
+        x = self.quantizer(x)
         return super().forward(x)
+
+class DiTBlock(nn.Module):
+    """
+    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    """
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True).half()
+        )
+
+    def forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -182,9 +199,9 @@ class FlattenDiTBlock(nn.Module):
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = FlattenMlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
         self.adaLN_modulation = nn.Sequential(
-            Quantizer(),
             nn.SiLU(),
-            Linear4bit.from_float(nn.Linear(hidden_size, 6 * hidden_size, bias=True))
+            Quantizer(),
+            Linear4bit.from_float(nn.Linear(hidden_size, 6 * hidden_size, bias=True).half())
         )
 
     def forward(self, x, c):
@@ -194,7 +211,9 @@ class FlattenDiTBlock(nn.Module):
         return x
     
 if __name__ == '__main__':
-    model = FlattenDiTBlock(1152, 16)
-    x = torch.randn(1, 256, 1152)
-    c = torch.randn(1, 256, 1152)
-    y = model(x, c)
+    model_int4 = FlattenDiTBlock(1152, 16)
+    model_fp16 = DiTBlock(1152, 16)
+    x = torch.randn(4, 256, 1152)
+    c = torch.randn(4, 1152)
+    y = model_int4(x, c)
+    y = model_int4(x, c)
