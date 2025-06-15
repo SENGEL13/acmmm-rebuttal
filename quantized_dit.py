@@ -210,10 +210,157 @@ class FlattenDiTBlock(nn.Module):
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
     
+# ... existing code ...
+
 if __name__ == '__main__':
-    model_int4 = FlattenDiTBlock(1152, 16)
-    model_fp16 = DiTBlock(1152, 16)
-    x = torch.randn(4, 256, 1152)
-    c = torch.randn(4, 1152)
-    y = model_int4(x, c)
-    y = model_int4(x, c)
+    import time
+    import torch.cuda
+    import gc
+    from torch.profiler import profile, record_function, ProfilerActivity
+    
+    # 设置设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+    
+    # 创建模型
+    model_int4 = FlattenDiTBlock(1152, 16).to(device)
+    model_fp16 = DiTBlock(1152, 16).to(device)
+    
+    # 创建测试数据
+    batch_size = 4
+    seq_len = 256
+    hidden_size = 1152
+    x = torch.randn(batch_size, seq_len, hidden_size).to(device)
+    c = torch.randn(batch_size, hidden_size).to(device)
+    
+    # 预热
+    print("预热模型...")
+    for _ in range(10):
+        with torch.no_grad():
+            _ = model_int4(x, c)
+            _ = model_fp16(x, c)
+    
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    
+    def measure_memory_and_time(model, x, c, model_name, num_runs=100):
+        """测量模型的内存使用和推理时间"""
+        gc.collect()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.synchronize()
+        
+        # 记录初始内存
+        if device.type == 'cuda':
+            memory_before = torch.cuda.memory_allocated()
+        
+        # 时间测试
+        times = []
+        model.eval()
+        
+        with torch.no_grad():
+            for i in range(num_runs):
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                
+                start_time = time.time()
+                output = model(x, c)
+                
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                
+                end_time = time.time()
+                times.append(end_time - start_time)
+        
+        # 内存统计
+        if device.type == 'cuda':
+            memory_after = torch.cuda.memory_allocated()
+            peak_memory = torch.cuda.max_memory_allocated()
+            memory_used = memory_after - memory_before
+        else:
+            memory_used = 0
+            peak_memory = 0
+        
+        # 时间统计
+        avg_time = sum(times) * 1000 / len(times)  # 转换为毫秒
+        min_time = min(times) * 1000
+        max_time = max(times) * 1000
+        
+        print(f"\n{model_name} 性能统计:")
+        print(f"  平均推理时间: {avg_time:.2f} ms")
+        print(f"  最小推理时间: {min_time:.2f} ms") 
+        print(f"  最大推理时间: {max_time:.2f} ms")
+        
+        if device.type == 'cuda':
+            print(f"  内存使用: {memory_used / 1024**2:.2f} MB")
+            print(f"  峰值内存: {peak_memory / 1024**2:.2f} MB")
+        
+        return avg_time, memory_used, peak_memory
+    
+    def get_model_size(model):
+        """计算模型参数大小"""
+        param_size = 0
+        buffer_size = 0
+        
+        for param in model.parameters():
+            param_size += param.nelement() * param.element_size()
+        
+        for buffer in model.buffers():
+            buffer_size += buffer.nelement() * buffer.element_size()
+        
+        total_size = param_size + buffer_size
+        return total_size / 1024**2  # 转换为MB
+    
+    # 测试模型大小
+    print("\n模型大小比较:")
+    int4_size = get_model_size(model_int4)
+    fp16_size = get_model_size(model_fp16)
+    print(f"INT4 模型大小: {int4_size:.2f} MB")
+    print(f"FP16 模型大小: {fp16_size:.2f} MB")
+    print(f"压缩比: {fp16_size/int4_size:.2f}x")
+    
+    # 测试推理性能
+    print("\n推理性能测试:")
+    int4_time, int4_memory, int4_peak = measure_memory_and_time(
+        model_int4, x, c, "INT4 模型", num_runs=100
+    )
+    
+    fp16_time, fp16_memory, fp16_peak = measure_memory_and_time(
+        model_fp16, x, c, "FP16 模型", num_runs=100
+    )
+    
+    # 性能对比
+    print(f"\n性能对比:")
+    print(f"时延比较: INT4 vs FP16 = {int4_time:.2f} ms vs {fp16_time:.2f} ms")
+    if fp16_time > 0:
+        speedup = fp16_time / int4_time
+        print(f"加速比: {speedup:.2f}x {'(INT4更快)' if speedup > 1 else '(FP16更快)'}")
+    
+    if device.type == 'cuda':
+        print(f"内存使用比较: INT4 vs FP16 = {int4_memory/1024**2:.2f} MB vs {fp16_memory/1024**2:.2f} MB")
+        if fp16_memory > 0:
+            memory_ratio = fp16_memory / int4_memory if int4_memory > 0 else float('inf')
+            print(f"内存节省: {memory_ratio:.2f}x")
+    
+    # 详细性能分析（可选）
+    print(f"\n详细性能分析:")
+    
+    def detailed_profile(model, x, c, model_name):
+        """使用PyTorch Profiler进行详细分析"""
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA] if device.type == 'cuda' else [ProfilerActivity.CPU],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        ) as prof:
+            with record_function(f"{model_name}_forward"):
+                for _ in range(10):
+                    model(x, c)
+        
+        print(f"\n{model_name} 详细分析:")
+        print(prof.key_averages().table(sort_by="cuda_time_total" if device.type == 'cuda' else "cpu_time_total", row_limit=10))
+    
+    # 运行详细分析
+    detailed_profile(model_int4, x, c, "INT4")
+    detailed_profile(model_fp16, x, c, "FP16")
